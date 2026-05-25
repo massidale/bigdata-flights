@@ -1,0 +1,17 @@
+framework,size,run,wall_seconds,exit_code
+mapreduce,50,1,110.4,0
+sparkcore,50,1,42.1,0
+sparksql,50,1,38.1,0
+hiveql_pipelined,50,1,52.1,0
+mapreduce,100,1,114.2,0
+sparkcore,100,1,44.1,0
+sparksql,100,1,38.1,0
+hiveql_pipelined,100,1,60.1,0
+mapreduce,200,1,120.1,0
+sparkcore,200,1,52.1,0
+sparksql,200,1,48.1,0
+hiveql_pipelined,200,1,68.1,0
+mapreduce,400,1,150.2,0
+sparkcore,400,1,70.1,0
+sparksql,400,1,48.1,0
+hiveql_pipelined,400,1,78.1,0
