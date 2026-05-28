@@ -1,88 +1,81 @@
-"""Secondo job in Spark Core (RDD): statistiche voli per compagnia.
+# -*- coding: utf-8 -*-
+import time
 
-Pipeline:
-    Stage 1: (carrier, origin) -> stats per tratta
-    Stage 2: carrier            -> array annidato di tratte
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 
-Input atteso: /flight/bench_<size>/ (output di prep+replicate, header-less, 12 colonne).
-Schema (header-less, da prep/prepare.py):
-    0  op_unique_carrier      <-- usato
-    1  origin                 <-- usato
-    2  month                  <-- usato
-    3  dep_delay
-    4  arr_delay              <-- usato
-    5  cancelled              <-- usato
-    6..11 *_code/*_delay
-"""
-import csv
-import io
-import json
-import os
+spark = SparkSession.builder.appName("Task3.2_DelayReport_SparkCore_Final").getOrCreate()
+spark.sparkContext.setLogLevel("WARN")
 
-from pyspark import SparkContext
+INPUT_PATH = "hdfs://namenode:9000//user/root/input/flight_data_clean_50"
+OUTPUT_PATH = "hdfs://namenode:9000//output/task3_2_sparkcore_final"
 
-INPUT_PATH = os.environ.get(
-    "INPUT_PATH",
-    "hdfs://localhost:9000/flight/bench_100/",
-)
-OUTPUT_PATH = os.environ.get(
-    "OUTPUT_PATH",
-    "hdfs://localhost:9000/flight/output/sparkcore_100",
-)
+start_time = time.time()
 
 df = spark.read.csv(INPUT_PATH, header=True, inferSchema=True)
-df = df.repartition(8)  # Repartition per migliorare le performance
+repartition_num = 8
+df = df.repartition(repartition_num)
 
-flights = df.filter((F.col("dep_delay").isNotNull()) & (F.col("cancelled") == 0))
+df.cache()
+df.count()
+flights_valid_delay = df.filter((F.col("dep_delay").isNotNull()) & (F.col("cancelled") == 0))
 
-# QUERY 1: numero di voli appartenenti a tre fasce di ritardo in partenza
-# QUERY 2: per ciascuna fascia, il ritardo medio in partenza e il ritardo medio in arrivo
-query_1_2_result = flights.agg(
-    F.sum(F.when((F.col("dep_delay") > 0) & (F.col("dep_delay") < 15), 1).otherwise(0)).alias("basso_count"),
-    F.avg(F.when((F.col("dep_delay") > 0) & (F.col("dep_delay") < 15), F.col("dep_delay"))).alias(
-        "basso_dep_delay_avg"),
-    F.avg(F.when((F.col("dep_delay") > 0) & (F.col("dep_delay") < 15), F.col("arr_delay"))).alias(
-        "basso_arr_delay_avg"),
+stats_ritardi_df = flights_valid_delay.groupBy("origin", "month").agg(
+    F.sum(F.when(F.col("dep_delay") < 15, 1).otherwise(0)).alias("basso_count"),
+    F.avg(F.when(F.col("dep_delay") < 15, F.col("dep_delay"))).alias("basso_dep_delay_avg"),
+    F.avg(F.when(F.col("dep_delay") < 15, F.col("arr_delay"))).alias("basso_arr_delay_avg"),
+
     F.sum(F.when((F.col("dep_delay") >= 15) & (F.col("dep_delay") <= 60), 1).otherwise(0)).alias("medio_count"),
     F.avg(F.when((F.col("dep_delay") >= 15) & (F.col("dep_delay") <= 60), F.col("dep_delay"))).alias(
         "medio_dep_delay_avg"),
     F.avg(F.when((F.col("dep_delay") >= 15) & (F.col("dep_delay") <= 60), F.col("arr_delay"))).alias(
         "medio_arr_delay_avg"),
+
     F.sum(F.when(F.col("dep_delay") > 60, 1).otherwise(0)).alias("alto_count"),
     F.avg(F.when(F.col("dep_delay") > 60, F.col("dep_delay"))).alias("alto_dep_delay_avg"),
     F.avg(F.when(F.col("dep_delay") > 60, F.col("arr_delay"))).alias("alto_arr_delay_avg")
 )
 
-query_1_2_result.repartition(1).write.csv(OUTPUT_PATH + "/query_1_2", header=True, mode="overwrite")
+exploded_causes_df = df.select(
+    "origin", "month",
+    F.explode(F.array(
+        F.struct(F.lit("carrier_delay").alias("cause"),
+                 F.when(F.col("carrier_delay") > 0, 1).otherwise(0).alias("cnt")),
+        F.struct(F.lit("weather_delay").alias("cause"),
+                 F.when(F.col("weather_delay") > 0, 1).otherwise(0).alias("cnt")),
+        F.struct(F.lit("nas_delay").alias("cause"), F.when(F.col("nas_delay") > 0, 1).otherwise(0).alias("cnt")),
+        F.struct(F.lit("security_delay").alias("cause"),
+                 F.when(F.col("security_delay") > 0, 1).otherwise(0).alias("cnt")),
+        F.struct(F.lit("late_aircraft_delay").alias("cause"),
+                 F.when(F.col("late_aircraft_delay") > 0, 1).otherwise(0).alias("cnt")),
+        F.struct(F.concat(F.lit("canc_"), F.col("cancellation_code")).alias("cause"),
+                 F.when((F.col("cancelled") == 1) & (F.col("cancellation_code").isNotNull()), 1).otherwise(0).alias(
+                     "cnt"))
+    )).alias("cause_struct")
+).select(
+    "origin", "month",
+    F.col("cause_struct.cause").alias("cause"),
+    F.col("cause_struct.cnt").alias("cnt")
+).filter(F.col("cnt") > 0)
 
-# QUERY 3: top 3 cause di ritardo più frequenti nel dataset
-cause_counts = [
-    flights.agg(F.sum(F.when(F.col("carrier_delay") > 0, 1).otherwise(0)).alias("num_flights"))
-    .withColumn("cause", F.lit("carrier_delay")),
-    flights.agg(F.sum(F.when(F.col("weather_delay") > 0, 1).otherwise(0)).alias("num_flights"))
-    .withColumn("cause", F.lit("weather_delay")),
-    flights.agg(F.sum(F.when(F.col("nas_delay") > 0, 1).otherwise(0)).alias("num_flights"))
-    .withColumn("cause", F.lit("nas_delay")),
-    flights.agg(F.sum(F.when(F.col("security_delay") > 0, 1).otherwise(0)).alias("num_flights"))
-    .withColumn("cause", F.lit("security_delay")),
-    flights.agg(F.sum(F.when(F.col("late_aircraft_delay") > 0, 1).otherwise(0)).alias("num_flights"))
-    .withColumn("cause", F.lit("late_aircraft_delay"))
-]
+cause_counts_df = exploded_causes_df.groupBy("origin", "month", "cause").count().withColumnRenamed("count", "freq")
 
-all_causes = cause_counts[0]
-for cause_df in cause_counts[1:]:
-    all_causes = all_causes.unionByName(cause_df)
+ranking_window = Window.partitionBy("origin", "month").orderBy(F.col("freq").desc())
 
-ranking_window = Window.orderBy(F.col("num_flights").desc())
-query_3_result = (
-    all_causes
-    .withColumn("rank", F.rank().over(ranking_window))
-    .select("rank", "cause", "num_flights")
-    .filter(F.col("rank") <= 3)
-    .orderBy("rank")
+ranked_causes_df = cause_counts_df.withColumn("rnk", F.row_number().over(ranking_window)).filter(F.col("rnk") <= 3)
+
+top_3_causes_columns = ranked_causes_df.groupBy("origin", "month").agg(
+    F.max(F.when(F.col("rnk") == 1, F.col("cause"))).alias("top_causa_1"),
+    F.max(F.when(F.col("rnk") == 2, F.col("cause"))).alias("top_causa_2"),
+    F.max(F.when(F.col("rnk") == 3, F.col("cause"))).alias("top_causa_3")
 )
 
-query_3_result.repartition(1).write.csv(OUTPUT_PATH + "/query_3", header=True, mode="overwrite")
+final_report_df = stats_ritardi_df.join(top_3_causes_columns, on=["origin", "month"], how="left") \
+    .na.fill("Nessuna", ["top_causa_1", "top_causa_2", "top_causa_3"]) \
+    .orderBy("origin", "month")
+
+final_report_df.coalesce(1).write.csv(OUTPUT_PATH + "/final_report", header=True, mode="overwrite")
 
 end_time = time.time()
 total_time_s = end_time - start_time
@@ -93,7 +86,7 @@ summary_row = [{
     "execution_mode": "local",
     "input_path": INPUT_PATH,
     "output_path": OUTPUT_PATH,
-    "repartition_num": 8,
+    "repartition_num": repartition_num,
     "app_name": spark.sparkContext.appName,
 }]
 
@@ -104,5 +97,4 @@ summary_df.coalesce(1).write.csv(
     mode="overwrite",
 )
 
-if __name__ == "__main__":
-    main()
+spark.stop()

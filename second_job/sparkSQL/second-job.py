@@ -1,19 +1,12 @@
-import os
+# -*- coding: utf-8 -*-
+import time
 
 from pyspark.sql import SparkSession
-from pyspark.sql import functions as F
 from pyspark.sql.types import (
-    StructType, StructField, StringType, IntegerType, DoubleType,
+    StructType, StructField,
+    StringType, IntegerType, DoubleType
 )
 
-# 1. SparkSession
-spark = SparkSession.builder \
-    .appName("AnalisiVoli") \
-    .getOrCreate()
-spark.sparkContext.setLogLevel("WARN")
-
-# 2. Schema esplicito (12 colonne, header-less, output di prep/prepare.py).
-# Niente inferSchema: lo schema e' fisso e definito a monte dalla prep.
 schema = StructType([
     StructField("origin", StringType(), True),
     StructField("month", IntegerType(), True),
@@ -28,70 +21,130 @@ schema = StructType([
     StructField("late_aircraft_delay", DoubleType(), True),
 ])
 
-INPUT_PATH = os.environ.get(
-    "INPUT_PATH",
-    "hdfs://localhost:9000/flight/bench_100/",
+spark = (
+    SparkSession.builder
+    .appName("Task3.2_DelayReport_Final_SparkSQL")
+    .config("spark.sql.shuffle.partitions", "24")
+    .config("spark.sql.adaptive.enabled", "true")
+    .getOrCreate()
 )
 
-# 4. Output finale: JSON-line su HDFS (formato uniforme con gli altri 3 job).
-OUTPUT_PATH = os.environ.get(
-    "OUTPUT_PATH",
-    "hdfs://localhost:9000/flight/output/sparksql_100",
+spark.sparkContext.setLogLevel("WARN")
+
+INPUT_PATH = "hdfs://namenode:9000//user/root/input/flight_data_clean_400"
+OUTPUT_PATH = "hdfs://namenode:9000//output/task3_2_final_report"
+
+start_time = time.time()
+
+df = (
+    spark.read
+    .schema(schema)
+    .option("header", "true")
+    .csv(INPUT_PATH)
 )
 
-df = spark.read.schema(SCHEMA).csv(INPUT_PATH, header=False)
+repartition_num = 24
+df = df.repartition(repartition_num)
 
-# QUERY 1 + 2
-query_1_2 = """
-SELECT
-  SUM(CASE WHEN dep_delay < 15 AND dep_delay > 0 THEN 1 ELSE 0 END) AS basso_count,
-  AVG(CASE WHEN dep_delay < 15 AND dep_delay > 0 THEN dep_delay ELSE NULL END) AS basso_dep_delay_avg,
-  AVG(CASE WHEN dep_delay < 15 AND dep_delay > 0 THEN arr_delay ELSE NULL END) AS basso_arr_delay_avg,
-  SUM(CASE WHEN dep_delay >= 15 AND dep_delay <= 60 THEN 1 ELSE 0 END) AS medio_count,
-  AVG(CASE WHEN dep_delay >= 15 AND dep_delay <= 60 THEN dep_delay ELSE NULL END) AS medio_dep_delay_avg,
-  AVG(CASE WHEN dep_delay >= 15 AND dep_delay <= 60 THEN arr_delay ELSE NULL END) AS medio_arr_delay_avg,
-  SUM(CASE WHEN dep_delay > 60 THEN 1 ELSE 0 END) AS alto_count,
-  AVG(CASE WHEN dep_delay > 60 THEN dep_delay ELSE NULL END) AS alto_dep_delay_avg,
-  AVG(CASE WHEN dep_delay > 60 THEN arr_delay ELSE NULL END) AS alto_arr_delay_avg
-FROM flights
-WHERE dep_delay IS NOT NULL AND cancelled = 0
-"""
+df.cache()
+df.count()
 
-query_1_result = spark.sql(query_1_2)
-query_1_result.coalesce(1).write.csv(OUTPUT_PATH + "/query_1_2", header=True, mode="overwrite")
+df.createOrReplaceTempView("flights")
 
-# QUERY 3 ottimizzata (singola scansione)
-query_3 = """
-WITH cause_counts AS (
-  SELECT
-    cause,
-    SUM(cnt) AS num_flights
-  FROM (
-    SELECT
-      stack(5,
-        'carrier_delay', CASE WHEN carrier_delay > 0 THEN 1 ELSE 0 END,
-        'weather_delay', CASE WHEN weather_delay > 0 THEN 1 ELSE 0 END,
-        'nas_delay', CASE WHEN nas_delay > 0 THEN 1 ELSE 0 END,
-        'security_delay', CASE WHEN security_delay > 0 THEN 1 ELSE 0 END,
-        'late_aircraft_delay', CASE WHEN late_aircraft_delay > 0 THEN 1 ELSE 0 END
-      ) AS (cause, cnt)
-    FROM flights
-    WHERE cancelled = 0
-  ) s
-  GROUP BY cause
+query_report_completo = """
+                        WITH stats_ritardi AS (
+                            -- STAGE 1 & 2: Classificazione fasce e aggregazione metriche (a) e (b) per aeroporto e mese
+                            SELECT origin,
+                            month \
+                           , SUM (CASE WHEN dep_delay \
+                           < 15 THEN 1 ELSE 0 END) AS basso_count \
+                           , AVG (CASE WHEN dep_delay \
+                           < 15 THEN dep_delay ELSE NULL END) AS basso_dep_delay_avg \
+                           , AVG (CASE WHEN dep_delay \
+                           < 15 THEN arr_delay ELSE NULL END) AS basso_arr_delay_avg \
+                           , SUM (CASE WHEN dep_delay >= 15 AND dep_delay <= 60 THEN 1 ELSE 0 END) AS medio_count \
+                           , AVG (CASE WHEN dep_delay >= 15 AND dep_delay <= 60 THEN dep_delay ELSE NULL END) AS medio_dep_delay_avg \
+                           , AVG (CASE WHEN dep_delay >= 15 AND dep_delay <= 60 THEN arr_delay ELSE NULL END) AS medio_arr_delay_avg \
+                           , SUM (CASE WHEN dep_delay \
+                           > 60 THEN 1 ELSE 0 END) AS alto_count \
+                           , AVG (CASE WHEN dep_delay \
+                           > 60 THEN dep_delay ELSE NULL END) AS alto_dep_delay_avg \
+                           , AVG (CASE WHEN dep_delay \
+                           > 60 THEN arr_delay ELSE NULL END) AS alto_arr_delay_avg
+                        FROM flights
+                        WHERE cancelled = 0 AND dep_delay IS NOT NULL
+                        GROUP BY origin, month
+                            ), \
+                            cause_unpivoted AS (
+                        -- STAGE 3: Unpivot delle cause sia di ritardo che di cancellazione tramite stack()
+                        SELECT
+                            origin, month, cause
+                        FROM flights
+                            LATERAL VIEW stack(6, 'carrier_delay', CASE WHEN carrier_delay > 0 THEN 1 ELSE 0 END, 'weather_delay', CASE WHEN weather_delay > 0 THEN 1 ELSE 0 END, 'nas_delay', CASE WHEN nas_delay > 0 THEN 1 ELSE 0 END, 'security_delay', CASE WHEN security_delay > 0 THEN 1 ELSE 0 END, 'late_aircraft_delay', CASE WHEN late_aircraft_delay > 0 THEN 1 ELSE 0 END, CONCAT('canc_', cancellation_code), CASE WHEN cancelled = 1 AND cancellation_code IS NOT NULL THEN 1 ELSE 0 END
+                            ) s AS (cause, cnt)
+                        WHERE cnt \
+                            > 0 \
+                          AND cause IS NOT NULL
+                            ) \
+                            , cause_conteggiate AS (
+                        -- Calcolo frequenza di ogni causa per specifico aeroporto e mese
+                        SELECT
+                            origin, month, cause, COUNT (*) AS freq
+                        FROM cause_unpivoted
+                        GROUP BY origin, month, cause
+                            ), \
+                            cause_classificate AS (
+                        -- Assegnazione del ranking locale basato sulla frequenza
+                        SELECT
+                            origin, month, cause, ROW_NUMBER() OVER (PARTITION BY origin, month ORDER BY freq DESC) AS rnk
+                        FROM cause_conteggiate
+                            ), top_3_cause AS (
+                        -- Pivot condizionale per estrarre esattamente le prime 3 cause su singola riga
+                        SELECT
+                            origin, month, MAX (CASE WHEN rnk = 1 THEN cause ELSE NULL END) AS top_causa_1, MAX (CASE WHEN rnk = 2 THEN cause ELSE NULL END) AS top_causa_2, MAX (CASE WHEN rnk = 3 THEN cause ELSE NULL END) AS top_causa_3
+                        FROM cause_classificate
+                        WHERE rnk <= 3
+                        GROUP BY origin, month
+                            )
+
+                        SELECT r.origin, \
+                               r.month, \
+                               r.basso_count, \
+                               r.basso_dep_delay_avg, \
+                               r.basso_arr_delay_avg, \
+                               r.medio_count, \
+                               r.medio_dep_delay_avg, \
+                               r.medio_arr_delay_avg, \
+                               r.alto_count, \
+                               r.alto_dep_delay_avg, \
+                               r.alto_arr_delay_avg, \
+                               COALESCE(c.top_causa_1, 'Nessuna') AS top_causa_1, \
+                               COALESCE(c.top_causa_2, 'Nessuna') AS top_causa_2, \
+                               COALESCE(c.top_causa_3, 'Nessuna') AS top_causa_3
+                        FROM stats_ritardi r
+                                 LEFT JOIN top_3_cause c ON r.origin = c.origin AND r.month = c.month
+                        ORDER BY r.origin, r.month \
+                        """
+
+report_df = spark.sql(query_report_completo)
+report_df.coalesce(1).write.csv(OUTPUT_PATH + "/final_report", header=True, mode="overwrite")
+
+end_time = time.time()
+total_time_s = end_time - start_time
+
+summary_row = [{
+    "total_time_s": total_time_s,
+    "datasetDimension": "100%",
+    "execution_mode": "docker-hdfs",
+    "input_path": INPUT_PATH,
+    "output_path": OUTPUT_PATH,
+    "repartition_num": repartition_num,
+    "app_name": spark.sparkContext.appName,
+}]
+
+summary_df = spark.createDataFrame(summary_row)
+summary_df.coalesce(1).write.csv(
+    OUTPUT_PATH + "/run_summary",
+    header=True,
+    mode="overwrite",
 )
-SELECT
-  cause,
-  num_flights
-FROM cause_counts
-ORDER BY num_flights DESC
-LIMIT 3
-"""
-
-query_3_result = spark.sql(query_3)
-query_3_result.coalesce(1).write.csv(OUTPUT_PATH + "/query_3", header=True, mode="overwrite")
-
-stats_final.write.mode("overwrite").json(OUTPUT_PATH)
-print(f"Output scritto in: {OUTPUT_PATH}")
-
-spark.stop()
