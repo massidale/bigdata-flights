@@ -1,0 +1,2 @@
+app_name,datasetDimension,execution_mode,input_path,output_path,repartition_num,total_time_s
+Task3.2_DelayReport_SparkCore_Final,100%,local,hdfs://namenode:9000//input/bench_100,hdfs://namenode:9000//output/sparkcore/bench_100,8,28.588139057159424

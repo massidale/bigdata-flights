@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
-"""Mapper: estrae l'aeroporto di partenza e il mese come chiave.
-
-Input (CSV):
-    origin,month,dep_delay,arr_delay,cancelled,cancellation_code,carrier_delay,...
-
-Output:
-    origin,month<TAB>{"dep_delay": ..., "arr_delay": ..., "cancelled": ..., "cancellation_code": ..., ...}
-"""
 import json
 import sys
+import io
 
+# Forza la gestione dell'encoding UTF-8 ignorando caratteri non validi (Previene UnicodeDecodeError)
+sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8', errors='ignore')
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='ignore')
 
 def main():
     out = sys.stdout
@@ -26,7 +22,6 @@ def main():
         month = tokens[1]
 
         try:
-            # Creazione del payload in un dizionario
             payload = {
                 "dep_delay": float(tokens[2]) if tokens[2] else 0.0,
                 "arr_delay": float(tokens[3]) if tokens[3] else 0.0,
@@ -43,7 +38,6 @@ def main():
 
         key = f"{origin},{month}"
         out.write(f"{key}\t{json.dumps(payload, ensure_ascii=False)}\n")
-
 
 if __name__ == "__main__":
     main()

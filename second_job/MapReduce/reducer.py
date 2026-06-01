@@ -1,23 +1,18 @@
 #!/usr/bin/env python3
-"""Reducer: raggruppa per aeroporto e mese e produce il report finale.
-
-Input (ordinato per chiave):
-    origin,month<TAB>{"dep_delay": ..., "arr_delay": ..., ...}
-
-Output: una riga CSV per ogni gruppo (aeroporto, mese) con i dati statistici:
-    origin,month,basso_count,basso_dep_avg,basso_arr_avg,...
-"""
 import json
 import sys
+import io
 from collections import defaultdict
 
+# Forza la gestione dell'encoding UTF-8 ignorando caratteri non validi
+sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8', errors='ignore')
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='ignore')
 
 def emit(key, accumulators, cause_map):
     basso_count, basso_dep_sum, basso_arr_sum, \
         medio_count, medio_dep_sum, medio_arr_sum, \
         alto_count, alto_dep_sum, alto_arr_sum = accumulators
 
-    # Calcolo delle medie
     basso_dep_avg = basso_dep_sum / basso_count if basso_count > 0 else 0.0
     basso_arr_avg = basso_arr_sum / basso_count if basso_count > 0 else 0.0
     medio_dep_avg = medio_dep_sum / medio_count if medio_count > 0 else 0.0
@@ -25,7 +20,6 @@ def emit(key, accumulators, cause_map):
     alto_dep_avg = alto_dep_sum / alto_count if alto_count > 0 else 0.0
     alto_arr_avg = alto_arr_sum / alto_count if alto_count > 0 else 0.0
 
-    # Sort delle cause per estrarre la Top 3
     sorted_causes = sorted(cause_map.items(), key=lambda x: x[1], reverse=True)
     top1 = sorted_causes[0][0] if len(sorted_causes) > 0 else "Nessuna"
     top2 = sorted_causes[1][0] if len(sorted_causes) > 1 else "Nessuna"
@@ -39,12 +33,8 @@ def emit(key, accumulators, cause_map):
     )
     sys.stdout.write(record_str)
 
-
 def main():
     current_key = None
-
-    # Inizializza gli accumulatori per calcolare medie e conteggi
-    # [basso_cnt, basso_dep_s, basso_arr_s, medio_cnt, medio_dep_s, ...]
     accumulators = [0, 0.0, 0.0, 0, 0.0, 0.0, 0, 0.0, 0.0]
     cause_map = defaultdict(int)
 
@@ -67,12 +57,9 @@ def main():
             if current_key is not None:
                 emit(current_key, accumulators, cause_map)
             current_key = key
-
-            # Reset delle metriche per la nuova chiave
             accumulators = [0, 0.0, 0.0, 0, 0.0, 0.0, 0, 0.0, 0.0]
             cause_map.clear()
 
-        # Aggiornamento delle metriche in base al payload ricevuto
         cancelled = payload.get("cancelled", 0)
         dep_delay = payload.get("dep_delay", 0.0)
         arr_delay = payload.get("arr_delay", 0.0)
@@ -103,7 +90,6 @@ def main():
 
     if current_key is not None:
         emit(current_key, accumulators, cause_map)
-
 
 if __name__ == "__main__":
     main()
