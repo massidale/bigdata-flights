@@ -1,0 +1,2 @@
+app_name,datasetDimension,execution_mode,input_path,output_path,repartition_num,total_time_s
+Task3.2_DelayReport_SparkSQL_Final,100%,docker-hdfs,hdfs://namenode:9000//input/bench_100,hdfs://namenode:9000//output/sparksql/bench_100,100,23.521244049072266

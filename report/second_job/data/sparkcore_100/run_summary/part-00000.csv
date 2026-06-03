@@ -1,0 +1,2 @@
+total_time_s,datasetDimension,execution_mode,input_path,output_path,app_name
+41.85244679450989,100%,local,hdfs://namenode:9000/input/bench_100,hdfs://namenode:9000/output/sparkcore/bench100,Task3.2_DelayReport_SparkCore
