@@ -1,38 +1,60 @@
-#!/usr/bin/env bash
-# Esegue il secondo job in HiveQL via beeline.
-# Engine sottostante: Tez (default in Hive 4) su YARN, leggendo le tabelle da HDFS.
+#!/bin/bash
 
-set -e
+# Definisci le dimensioni dei dataset
+SIZES=("bench_50" "bench_100" "bench_200" "bench_400")
 
-# Dir di questo script -> path dell'HQL da eseguire.
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-HQL="$SCRIPT_DIR/second-job.hql"
+# Percorsi base (S3)
+S3_BUCKET="s3://bigdata2026bucket-giacomo-cui"
+LOCAL_HQL="/tmp/esercitazione_3_2_hive.hql"
 
-# Parametri I/O (gestiti dall'orchestratore bench/run_all.sh).
-INPUT_PATH="${INPUT_PATH:-hdfs://localhost:9000/flight/sample/}"
-OUTPUT_PATH="${OUTPUT_PATH:-hdfs://localhost:9000/flight/output/hiveql_sample}"
+echo "Avvio della suite di test completa..."
 
-# Uso esplicito di $HIVE_HOME/bin/beeline: il beeline nel PATH potrebbe essere
-# quello vecchio (2.x) bundlato in Spark, incompatibile con Hive 4.
-HIVE_HOME="${HIVE_HOME:-/Users/giacomo/hive-4.0.1}"
+# 1. SCARICA IL FILE HQL DA S3 ALLA CARTELLA LOCALE DEL MASTER NODE
+# In questo modo Hive potrà leggerlo correttamente tramite il parametro -f
+echo "Download dello script HQL da S3..."
+aws s3 cp "$S3_BUCKET/scripts/esercitazione_3_2_hive.hql" "$LOCAL_HQL"
 
-# Derby (metastore embedded di Hive) scrive il suo derby.log nella CWD del
-# processo JVM. _JAVA_OPTIONS e' letto da OGNI JVM all'avvio, quindi il flag
-# arriva alla java di beeline indipendentemente da come e' invocata.
-export _JAVA_OPTIONS="-Dderby.system.home=$HIVE_HOME"
+if [ $? -ne 0 ]; then
+    echo "ERRORE: Impossibile scaricare lo script HQL da S3. Verifica il percorso."
+    exit 1
+fi
 
-# Hive 4 NON interpola variabili (hivevar/hiveconf) dentro LOCATION/DIRECTORY:
-# il parser le tratta come letterali. Aggiriamo con sed su una copia temporanea
-# dell'HQL, sostituendo sia input_path che output_path.
-# Cancello anche l'output dir su HDFS in advance: INSERT OVERWRITE DIRECTORY
-# sovrascrive, ma e' piu' pulito ripartire dal vuoto.
-HQL_TMP="$(mktemp -t firstjob_hql.XXXXXX)"
-trap 'rm -f "$HQL_TMP"' EXIT
-sed -e "s|\${hivevar:input_path}|${INPUT_PATH}|g" \
-    -e "s|\${hivevar:output_path}|${OUTPUT_PATH}|g" \
-    "$HQL" > "$HQL_TMP"
+for SIZE in "${SIZES[@]}"
+do
+    echo "--------------------------------------------------------"
+    echo "TESTING DATASET: $SIZE"
+    echo "--------------------------------------------------------"
 
-hdfs dfs -rm -r -f "$OUTPUT_PATH" 2>/dev/null || true
+    INPUT_PATH="$S3_BUCKET/data/$SIZE/"
+    OUTPUT_PATH="$S3_BUCKET/output/hive/$SIZE"
 
-# Beeline in modalita' EMBEDDED (URL "jdbc:hive2://" senza host).
-"$HIVE_HOME/bin/beeline" -u 'jdbc:hive2://' -n "$(whoami)" -f "$HQL_TMP"
+    # Pulizia della cartella di output su S3 prima del run per evitare conflitti
+    echo "Pulizia vecchia cartella di output S3 per $SIZE..."
+    aws s3 rm "$OUTPUT_PATH" --recursive 2>/dev/null
+
+    # 3. Esecuzione Hive
+    echo "Esecuzione Hive con Tez su EMR..."
+
+    # Passiamo i path S3 corretti e puntiamo al file .hql salvato localmente in /tmp
+    hive -hiveconf INPUT_PATH="$INPUT_PATH" \
+         -hiveconf OUTPUT_PATH="$OUTPUT_PATH" \
+         -f "$LOCAL_HQL"
+
+    echo "Terminato test per $SIZE"
+done
+
+echo "Tutti i benchmark sono stati completati con successo!"
+
+# 4. RACCOLTA DEI LOG/REPORT FINALI DA S3
+# Scarichiamo temporaneamente i risultati localmente per poter usare grep
+echo "Generazione del report finale delle performance..."
+mkdir -p /tmp/hive_outputs
+aws s3 cp "$S3_BUCKET/output/hive/" /tmp/hive_outputs/ --recursive --include "*.csv" --include "*0000*" 2>/dev/null
+
+# Esegui il grep sui file scaricati localmente
+grep -r "total_time_s" /tmp/hive_outputs/ > report_finale_performance.txt
+echo "Report salvato in report_finale_performance.txt"
+
+# Pulizia file temporanei locali
+rm -rf /tmp/hive_outputs
+rm -f "$LOCAL_HQL"
